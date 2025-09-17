@@ -1,149 +1,218 @@
 # Switch-GitAccount.ps1
 # Robust GitHub account switcher for Windows + Git Credential Manager
-# - Clears GitHub credentials from Windows Credential Manager (Generic Credentials)
-# - Unsets then sets global git user.name / user.email based on selection
-# - Tries to trigger re-auth by running `git fetch --all` (only if inside a repo)
+#
+# - Clears GitHub credentials using the modern Git Credential Manager.
+# - Unsets then sets the global git user.name and user.email.
+# - Directly forces a browser re-authentication prompt after switching.
 
-# ---- CONFIGURE YOUR EMAILS HERE ----
-$Profiles = @{
-  "shrey-regular" = @{
-      user  = "shreykc1"
-      email = "shreykc1@gmail.com"   # ← change to your personal GitHub email
-  }
-  "shrey-office"  = @{
-      user  = "shrey-resta"
-      email = "shrey.chandpa@restaverse.com"    # ← change to your office GitHub email
-  }
+# ---- PROFILES PERSISTENCE ----
+function Get-ConfigPath {
+    # Ensures the configuration directory and file path exist.
+    $base = Join-Path $env:APPDATA "gitswitch"
+    if (-not (Test-Path $base)) {
+        New-Item -Path $base -ItemType Directory -Force | Out-Null
+    }
+    return (Join-Path $base "profiles.json")
 }
 
-function Select-Account {
-    Write-Host "====================================="
+function Load-Profiles {
+    $path = Get-ConfigPath
+    if (Test-Path $path) {
+        try {
+            $json = Get-Content -Raw -Path $path
+            # Return a PSCustomObject which works like a hashtable for our purposes.
+            return ($json | ConvertFrom-Json -ErrorAction Stop)
+        }
+        catch {
+            Write-Warning "Could not load or parse profiles.json. A new one will be created."
+        }
+    }
+    # Return an empty object if no file exists.
+    return [PSCustomObject]@{}
+}
+
+function Save-Profiles($profiles) {
+    $path = Get-ConfigPath
+    ($profiles | ConvertTo-Json -Depth 5) | Set-Content -Path $path -Encoding UTF8
+}
+
+# ---- UI: MESSAGES & MENUS ----
+function Show-AddAccountsArt {
+    $art = @"
+`n
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║             No profiles found for Git Switcher             ║
+║                                                          ║
+║   ➜ Choose 'Add accounts' to create aliases with your    ║
+║     Git user.name and user.email.                        ║
+║                                                          ║
+║   Example:                                               ║
+║     Alias : personal                                     ║
+║     User  : john-wick                                    ║
+║     Email : john-wick@gmail.com                          ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+"@
+    Write-Host $art -ForegroundColor Cyan
+}
+
+function Show-MainMenu {
+    Clear-Host
+    Write-Host "=====================================" -ForegroundColor Green
     Write-Host "     GitHub Account Switcher"
-    Write-Host "====================================="
-    Write-Host "1) shrey-regular"
-    Write-Host "2) shrey-office"
-    Write-Host "====================================="
-    $choice = Read-Host "Select account (1 or 2)"
+    Write-Host "=====================================" -ForegroundColor Green
+    Write-Host " 1) Switch Account"
+    Write-Host " 2) Add New Account(s)"
+    Write-Host " 3) Exit"
+    Write-Host "=====================================" -ForegroundColor Green
+    $choice = Read-Host "Select an action (1-3)"
     switch ($choice) {
-        "1" { return "shrey-regular" }
-        "2" { return "shrey-office" }
+        "1" { return "change" }
+        "2" { return "add" }
+        "3" { return "exit" }
         default {
-            Write-Warning "Invalid selection. Exiting..."
-            exit 1
+            Write-Warning "Invalid selection."
+            return $null
         }
     }
 }
 
-function Remove-GitHubCreds {
-    Write-Host "`nRemoving saved GitHub credentials from Windows Credential Manager..."
-    # Enumerate all stored credentials via cmdkey and capture only the Target lines
-    $targets = @(cmdkey /list 2>$null | Select-String -Pattern '^\s*Target:\s*(.+)$' | ForEach-Object {
-        ($_.Matches[0].Groups[1].Value).Trim()
-    })
-
-    if (-not $targets -or $targets.Count -eq 0) {
-        Write-Host "No stored credentials found." -ForegroundColor Yellow
-        return
+# ---- CORE LOGIC ----
+function Add-Accounts($profiles) {
+    # Convert PSCustomObject to a Hashtable for easier manipulation (.ContainsKey, .Add).
+    $profilesHashtable = @{}
+    if ($null -ne $profiles) {
+        $profiles.psobject.properties | ForEach-Object { $profilesHashtable[$_.Name] = $_.Value }
     }
 
-    # Match anything obviously used by Git Credential Manager for GitHub
-    $gitTargets = $targets | Where-Object {
-        $_ -match '(?i)\bgit[:@]' -or $_ -match '(?i)github\.com'
+    do {
+        Write-Host "`n-- Add a New Account Profile --" -ForegroundColor Yellow
+        $alias = Read-Host "Enter a short Alias (e.g., personal, work)"
+        if ([string]::IsNullOrWhiteSpace($alias)) { Write-Warning "Alias cannot be empty."; continue }
+        if ($profilesHashtable.ContainsKey($alias)) { Write-Warning "Alias '$alias' already exists."; continue }
+
+        $user = Read-Host "Enter the Git user.name (e.g., john-wick)"
+        if ([string]::IsNullOrWhiteSpace($user)) { Write-Warning "user.name cannot be empty."; continue }
+
+        $email = Read-Host "Enter the Git user.email (e.g., john.wick@example.com)"
+        if ([string]::IsNullOrWhiteSpace($email)) { Write-Warning "user.email cannot be empty."; continue }
+
+        $profilesHashtable[$alias] = @{ user = $user; email = $email }
+        Save-Profiles -profiles $profilesHashtable
+        Write-Host "`n✅ Profile '$alias' saved successfully." -ForegroundColor Green
+
+        $again = Read-Host "`nAdd another account? (y/N)"
+    } while ($again -match '^(y|yes)$')
+
+    return $profilesHashtable
+}
+
+function Select-Account($profiles) {
+    $aliases = @($profiles.psobject.properties.Name) | Sort-Object
+    if ($aliases.Count -eq 0) {
+        Show-AddAccountsArt
+        return $null
     }
 
-    if (-not $gitTargets -or $gitTargets.Count -eq 0) {
-        Write-Host "No GitHub-related credentials found." -ForegroundColor Yellow
-    } else {
-        foreach ($t in $gitTargets) {
-            Write-Host "Deleting credential: $t"
-            cmdkey /delete:$t | Out-Null
-        }
+    Write-Host "`n=====================================" -ForegroundColor Cyan
+    Write-Host "          Select Account"
+    Write-Host "=====================================" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $aliases.Count; $i++) {
+        $alias = $aliases[$i]
+        $profile = $profiles.$alias
+        Write-Host ("{0}) {1}  ({2} <{3}>)" -f ($i + 1), $alias.PadRight(15), $profile.user, $profile.email)
     }
+    Write-Host "=====================================" -ForegroundColor Cyan
+    $choice = Read-Host "Select an account number (1-$($aliases.Count))"
 
-    # Extra sweep: known common target names created by GCM (old/new)
-    $common = @(
-        'git:https://github.com',
-        'git:github.com',
-        'LegacyGeneric:target=git:https://github.com'
-    )
-    foreach ($t in $common) {
-        cmdkey /delete:$t 2>$null | Out-Null
+    # Validate input is a number within the correct range.
+    if (($choice -as [int]) -and ([int]$choice -ge 1) -and ([int]$choice -le $aliases.Count)) {
+        $idx = [int]$choice - 1
+        return $aliases[$idx]
+    }
+    else {
+        Write-Warning "Invalid selection."
+        return $null
     }
 }
 
 function Ensure-GitPresent {
-    $gitVersion = (& git --version 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $gitVersion) {
-        Write-Error "Git is not available on PATH. Install Git for Windows and try again."
+    & git --version 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Git is not found in your PATH. Please install Git for Windows and ensure it's accessible."
         exit 1
     }
 }
 
 function Set-GlobalGitIdentity([string]$name, [string]$email) {
-    Write-Host "`nClearing old global git user.name and user.email..."
+    Write-Host "`n⚙️  Configuring global git identity..." -ForegroundColor Yellow
+
+    # Unset old values to ensure a clean state.
     git config --global --unset user.name 2>$null
     git config --global --unset user.email 2>$null
 
-    Write-Host "Setting new global identity:"
-    Write-Host "  user.name  = $name"
-    Write-Host "  user.email = $email"
+    Write-Host "  - Setting user.name  = $name"
     git config --global user.name "$name"
+    Write-Host "  - Setting user.email = $email"
     git config --global user.email "$email"
 
-    # (Optional) ensure Windows Credential Manager is used for auth
-    # This helps guarantee browser-based login on next network call
-    # Will not error if already set.
-    git config --global credential.helper manager-core 2>$null
-}
+    # Ensure Git Credential Manager is set as the credential helper.
+    # 'manager' is the modern and recommended value.
+    Write-Host "  - Ensuring credential.helper is 'manager'..."
+    git config --global credential.helper manager
 
-function Trigger-Reauth($account) {
-    Write-Host "`nForcing GitHub login via browser for $account..."
-
-    # Clear credentials at GCM level too
-    echo "protocol=https
-host=github.com" | git credential-manager-core erase 2>$null
-
-    # Pick repo URL based on account
-    switch ($account) {
-        "shrey-regular" { 
-            $testRepo = "https://github.com/shrey-resta/website-draft"  # 🔹 replace with real repo
-        }
-        "shrey-office" {
-            $testRepo = "https://github.com/Restaverse-Codespace/react-mobile-app.git"    # 🔹 replace with real repo
-        }
-        default {
-            $testRepo = "https://github.com/github/gitignore.git" # fallback (public repo)
-        }
-    }
-
-    # Force a credentialed call (browser should open if no creds)
-    git ls-remote $testRepo | Out-Null
-
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "✅ Browser login prompt should have appeared."
-    } else {
-        Write-Warning "GitHub auth did not trigger. Try running 'git pull' or 'git push' in a repo."
-    }
+    Write-Host "✅ Git identity configured." -ForegroundColor Green
 }
 
 
 
-# ---------------- Main ----------------
+
+# ==============================================================================
+# --- Main Execution Block ---
+# ==============================================================================
+
 Ensure-GitPresent
-$acct = Select-Account
-$profile = $Profiles[$acct]
+$Profiles = Load-Profiles
 
-if (-not $profile) {
-    Write-Error "Unknown profile selected. Exiting."
-    exit 1
-}
+do {
+    $action = Show-MainMenu
+    switch ($action) {
+        'add' {
+            $Profiles = Add-Accounts -profiles $Profiles
+            Write-Host "`nReturning to main menu..."
+            Start-Sleep -Seconds 2
+        }
 
-Write-Host "`nYou selected: $acct"
-Remove-GitHubCreds
-Set-GlobalGitIdentity -name $profile.user -email $profile.email
-Trigger-Reauth -account $acct
+        'change' {
+            if ($null -eq $Profiles -or $Profiles.psobject.properties.Count -eq 0) {
+                Show-AddAccountsArt
+                Write-Host "`nPlease add an account first."
+                Start-Sleep -Seconds 3
+                continue # Go back to the start of the loop
+            }
 
-Write-Host "`n-------------------------------------"
-Write-Host "✅ Switched to '$acct' globally."
-Write-Host "If a browser prompt didn't appear, run 'git fetch --all' inside a repository."
-Write-Host "-------------------------------------"
+            $selectedAlias = Select-Account -profiles $Profiles
+            if ($selectedAlias) {
+                $profile = $Profiles.$selectedAlias
+
+                Write-Host "`n➡️  Switching to account: '$selectedAlias'" -ForegroundColor Cyan
+                Set-GlobalGitIdentity -name $profile.user -email $profile.email
+
+                Write-Host "`n-----------------------------------------------------" -ForegroundColor Green
+                Write-Host "✅ Switched to '$selectedAlias'. You are ready to go!"
+                Write-Host "-----------------------------------------------------`n"
+
+                # After a successful switch, exit the script.
+                $action = 'exit'
+                Start-Sleep -Seconds 2
+            }
+            else {
+                Write-Warning "No account selected. Returning to main menu."
+                Start-Sleep -Seconds 2
+            }
+        }
+    }
+} while ($action -ne 'exit')
+
+Write-Host "`nBye! 👋"
